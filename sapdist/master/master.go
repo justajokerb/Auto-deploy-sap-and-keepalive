@@ -81,6 +81,9 @@ func main() {
 	flag.Parse()
 
 	// Load credentials from environment
+	if envUser := os.Getenv("ADMIN_USERNAME"); envUser != "" {
+		adminUser = envUser
+	}
 	if envPass := os.Getenv("ADMIN_PASSWORD"); envPass != "" {
 		adminPass = envPass
 	}
@@ -126,7 +129,7 @@ func main() {
 	log.Printf("Serving console UI from: %s", staticDir)
 	log.Printf("Metadata persistence file: %s", *metaFilePath)
 	if adminPass != "" {
-		log.Printf("Admin UI security: enabled (user: admin)")
+		log.Printf("Admin UI security: enabled (user: %s)", adminUser)
 	} else {
 		log.Printf("Admin UI security: disabled (unsecured)")
 	}
