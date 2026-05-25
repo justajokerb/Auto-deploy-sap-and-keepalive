@@ -555,7 +555,7 @@
             uploadProgressBar.style.width = '0%';
             progressContainer.classList.remove('hidden');
 
-            const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per chunk
+            const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB per chunk (optimized for high speed and Cloud Foundry limits)
             const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
             let uploadId = null;
 

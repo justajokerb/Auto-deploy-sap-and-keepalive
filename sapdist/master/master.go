@@ -463,7 +463,7 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse multipart body
-	r.ParseMultipartForm(10 * 1024 * 1024) // 10MB chunk max limit
+	r.ParseMultipartForm(2 * 1024 * 1024) // 2MB memory buffer limit, remaining goes to disk
 
 	uploadID := r.FormValue("uploadId")
 	chunkIndexStr := r.FormValue("chunkIndex")
@@ -494,13 +494,16 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read entire chunk into memory (typically 2MB)
-	chunkBytes, err := io.ReadAll(file)
+	// Get chunk size via seeker
+	chunkSizeVal, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		http.Error(w, "Failed to read chunk data: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to determine chunk size: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	chunkSizeVal := int64(len(chunkBytes))
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, "Failed to reset chunk file seeker: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	targetIDs := selectBestWorkerIDs(2) // Select up to 2 workers for RAID-1 redundancy
 	if len(targetIDs) == 0 {
@@ -511,7 +514,7 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	chunkID := fmt.Sprintf("%d_c%d", session.FileID, chunkIndex)
 	var replicas []common.WorkerReplica
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second} // Increase timeout for large chunk pressure testing
 
 	// Upload to all target workers
 	for _, wID := range targetIDs {
@@ -522,12 +525,19 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Reset chunk file seeker to start for each replica upload
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			log.Printf("[%s] Failed to seek chunk file for worker %s: %v", chunkID, wID, err)
+			continue
+		}
+
 		chunkURL := fmt.Sprintf("%s/chunks/%s", worker.URL, chunkID)
-		req, err := http.NewRequest(http.MethodPost, chunkURL, bytes.NewReader(chunkBytes))
+		req, err := http.NewRequest(http.MethodPost, chunkURL, io.NopCloser(file))
 		if err != nil {
 			log.Printf("[%s] Failed to create request for worker %s: %v", chunkID, wID, err)
 			continue
 		}
+		req.ContentLength = chunkSizeVal
 		req.Header.Set("Content-Type", "application/octet-stream")
 		if clusterToken != "" {
 			req.Header.Set("Authorization", "Bearer "+clusterToken)
