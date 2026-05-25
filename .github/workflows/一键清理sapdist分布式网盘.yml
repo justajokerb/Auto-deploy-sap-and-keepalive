@@ -6,7 +6,7 @@ on:
       region:
         description: '选择需要清理的区域'
         required: true
-        default: 'US(free)'
+        default: 'SG(free)'
         type: choice
         options:
           - SG(free)
