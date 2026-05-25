@@ -96,9 +96,7 @@ jobs:
 
     - name: Generate Security Credentials
       run: |
-        ADMIN_PASS=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16)
         CLUSTER_SEC=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
-        echo "ADMIN_PASS=$ADMIN_PASS" >> $GITHUB_ENV
         echo "CLUSTER_SEC=$CLUSTER_SEC" >> $GITHUB_ENV
 
     - name: Install CF CLI
@@ -276,7 +274,8 @@ jobs:
         cd deploy_master
         # 部署 Master 节点并设置环境变量
         cf push ${{ env.MASTER_APP_NAME }} -b binary_buildpack -m ${{ env.MEMORY }} -k ${{ env.DISK }} -c "./master_bin" --no-start
-        cf set-env ${{ env.MASTER_APP_NAME }} ADMIN_PASSWORD "${{ env.ADMIN_PASS }}"
+        cf set-env ${{ env.MASTER_APP_NAME }} ADMIN_USERNAME "${{ secrets.EMAIL }}"
+        cf set-env ${{ env.MASTER_APP_NAME }} ADMIN_PASSWORD "${{ secrets.PASSWORD }}"
         cf set-env ${{ env.MASTER_APP_NAME }} CLUSTER_SECRET "${{ env.CLUSTER_SEC }}"
         
         if cf start ${{ env.MASTER_APP_NAME }}; then
@@ -335,8 +334,8 @@ jobs:
         echo "🚀 Distributed Storage Pool deployed successfully!"
         echo "============================================="
         echo "Master Web Console: ${{ env.MASTER_URL }}"
-        echo "Admin Username: admin"
-        echo "Admin Password: ${{ env.ADMIN_PASS }}"
+        echo "Admin Username: ${{ secrets.EMAIL }}"
+        echo "Admin Password: ${{ secrets.PASSWORD }}"
         echo "Cluster Secret Token: ${{ env.CLUSTER_SEC }}"
         echo "Workers deployed: ${{ github.event.inputs.worker_count }}"
         echo "Region: ${{ github.event.inputs.region }}"
