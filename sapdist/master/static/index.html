@@ -188,15 +188,19 @@
                     <p class="text-xs text-slate-500 mb-6">Files will be chunked and spread dynamically</p>
                     
                     <!-- Drag and drop zone -->
-                    <div id="drop-zone" class="border border-dashed border-white/10 rounded-xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:border-violet-500/40 hover:bg-violet-500/[0.02] transition-all group min-h-[180px]">
-                        <input type="file" id="file-input" class="hidden">
+                    <div id="drop-zone" class="border border-dashed border-white/10 rounded-xl p-6 flex flex-col items-center justify-center text-center cursor-pointer hover:border-violet-500/40 hover:bg-violet-500/[0.02] transition-all group min-h-[180px]">
+                        <input type="file" id="file-input" multiple class="hidden">
+                        <input type="file" id="folder-input" webkitdirectory directory multiple class="hidden">
                         <div class="w-12 h-12 rounded-xl bg-violet-600/10 flex items-center justify-center text-violet-400 mb-3 group-hover:scale-110 transition-transform">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-6 h-6">
                                 <path stroke-linecap="round" stroke-linejoin="round" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
                             </svg>
                         </div>
-                        <p class="text-sm font-semibold text-slate-300">Drag & drop files here</p>
-                        <p class="text-xs text-slate-500 mt-1">or click to browse local files</p>
+                        <p class="text-sm font-semibold text-slate-300">Drag & drop files/folders here</p>
+                        <div class="flex gap-3 mt-4">
+                            <button type="button" onclick="event.stopPropagation(); document.getElementById('file-input').click();" class="px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors shadow-md shadow-violet-500/15">Select Files</button>
+                            <button type="button" onclick="event.stopPropagation(); document.getElementById('folder-input').click();" class="px-3 py-1.5 rounded-lg border border-white/10 hover:border-violet-500/30 text-slate-300 hover:text-white text-xs font-semibold transition-colors bg-white/5">Select Folders</button>
+                        </div>
                     </div>
                 </div>
 
@@ -527,17 +531,33 @@
         }
 
         // Upload Operations
-        function handleFileSelect(file) {
-            if (!file) return;
+        let uploadQueue = [];
+        let isUploading = false;
 
+        function enqueueUpload(file, relativePath) {
+            uploadQueue.push({ file, relativePath });
+            processQueue();
+        }
+
+        function processQueue() {
+            if (isUploading || uploadQueue.length === 0) return;
+            isUploading = true;
+
+            const task = uploadQueue.shift();
+            uploadFile(task.file, task.relativePath);
+        }
+
+        function uploadFile(file, relativePath) {
             // Show progress bar container
-            uploadingFileName.textContent = file.name;
+            const displayPath = relativePath || file.name;
+            uploadingFileName.textContent = displayPath;
             uploadingPercentage.textContent = '0%';
             uploadProgressBar.style.width = '0%';
             progressContainer.classList.remove('hidden');
 
             const formData = new FormData();
-            formData.append('file', file);
+            formData.append('file', file, displayPath);
+            formData.append('relativePath', displayPath);
 
             const xhr = new XMLHttpRequest();
             xhr.open('POST', '/api/upload', true);
@@ -553,27 +573,65 @@
 
             xhr.onload = function() {
                 if (xhr.status === 201) {
-                    showToast(`File "${file.name}" chunked and uploaded successfully`, 'success');
+                    showToast(`Uploaded successfully: ${displayPath}`, 'success');
                     fetchFiles();
                     fetchStatus();
                 } else {
-                    showToast(`Upload failed: ${xhr.responseText || 'Server error'}`, 'error');
+                    showToast(`Upload failed: ${displayPath} (${xhr.responseText || 'Server error'})`, 'error');
                 }
-                // Hide progress bar container after brief wait
-                setTimeout(() => progressContainer.classList.add('hidden'), 1000);
+                isUploading = false;
+                if (uploadQueue.length === 0) {
+                    setTimeout(() => progressContainer.classList.add('hidden'), 1000);
+                } else {
+                    processQueue();
+                }
             };
 
             xhr.onerror = function() {
-                showToast('Upload error occurred', 'error');
-                progressContainer.classList.add('hidden');
+                showToast(`Upload error: ${displayPath}`, 'error');
+                isUploading = false;
+                if (uploadQueue.length === 0) {
+                    progressContainer.classList.add('hidden');
+                } else {
+                    processQueue();
+                }
             };
 
             xhr.send(formData);
         }
 
+        function traverseFileTree(item, path) {
+            if (item.isFile) {
+                item.file(file => {
+                    enqueueUpload(file, path + file.name);
+                });
+            } else if (item.isDirectory) {
+                const dirReader = item.createReader();
+                dirReader.readEntries(entries => {
+                    for (let i = 0; i < entries.length; i++) {
+                        traverseFileTree(entries[i], path + item.name + "/");
+                    }
+                });
+            }
+        }
+
         // Drag and drop event listeners
         dropZone.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', (e) => handleFileSelect(e.target.files[0]));
+        
+        fileInput.addEventListener('change', (e) => {
+            if (fileInput.files.length) {
+                Array.from(fileInput.files).forEach(file => enqueueUpload(file, file.webkitRelativePath));
+                fileInput.value = '';
+            }
+        });
+
+        const folderInput = document.getElementById('folder-input');
+        folderInput.addEventListener('change', (e) => {
+            if (folderInput.files.length) {
+                Array.from(folderInput.files).forEach(file => enqueueUpload(file, file.webkitRelativePath));
+                folderInput.value = '';
+            }
+        });
 
         ['dragenter', 'dragover'].forEach(eventName => {
             dropZone.addEventListener(eventName, (e) => {
@@ -590,9 +648,22 @@
         });
 
         dropZone.addEventListener('drop', (e) => {
-            const dt = e.dataTransfer;
-            const file = dt.files[0];
-            handleFileSelect(file);
+            const items = e.dataTransfer.items;
+            if (items) {
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.kind === 'file') {
+                        const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+                        if (entry) {
+                            traverseFileTree(entry, "");
+                        } else {
+                            enqueueUpload(item.getAsFile(), "");
+                        }
+                    }
+                }
+            } else if (e.dataTransfer.files.length) {
+                Array.from(e.dataTransfer.files).forEach(file => enqueueUpload(file, ""));
+            }
         });
 
         // Initialize Loop Pings

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +39,54 @@ func init() {
 	metaData.Workers = make(map[string]common.WorkerStats)
 }
 
+var (
+	adminUser    = "admin"
+	adminPass    = ""
+	clusterToken = ""
+)
+
+func requireBasicAuth(username, password string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if username != "" && password != "" {
+			user, pass, ok := r.BasicAuth()
+			if !ok || user != username || pass != password {
+				w.Header().Set("WWW-Authenticate", `Basic realm="SAP Unified Storage"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+func requireClusterToken(secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if secret != "" {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, "Unauthorized: Missing Authorization header", http.StatusUnauthorized)
+				return
+			}
+			parts := strings.Split(authHeader, " ")
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" || parts[1] != secret {
+				http.Error(w, "Unauthorized: Invalid cluster token", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 func main() {
 	flag.Parse()
+
+	// Load credentials from environment
+	if envPass := os.Getenv("ADMIN_PASSWORD"); envPass != "" {
+		adminPass = envPass
+	}
+	if envToken := os.Getenv("CLUSTER_SECRET"); envToken != "" {
+		clusterToken = envToken
+	}
 
 	// Load existing metadata if available
 	loadMetadata()
@@ -48,13 +95,13 @@ func main() {
 	go startHealthChecker()
 
 	// Setup API routers
-	http.HandleFunc("/api/heartbeat", handleHeartbeat)
-	http.HandleFunc("/api/status", handleStatus)
-	http.HandleFunc("/api/files", handleFilesList)
-	http.HandleFunc("/api/upload", handleUpload)
-	http.HandleFunc("/api/download/", handleDownload)
-	http.HandleFunc("/api/delete/", handleDelete)
-	http.HandleFunc("/api/nodes/register", handleManualRegister)
+	http.HandleFunc("/api/heartbeat", requireClusterToken(clusterToken, handleHeartbeat))
+	http.HandleFunc("/api/status", requireBasicAuth(adminUser, adminPass, handleStatus))
+	http.HandleFunc("/api/files", requireBasicAuth(adminUser, adminPass, handleFilesList))
+	http.HandleFunc("/api/upload", requireBasicAuth(adminUser, adminPass, handleUpload))
+	http.HandleFunc("/api/download/", requireBasicAuth(adminUser, adminPass, handleDownload))
+	http.HandleFunc("/api/delete/", requireBasicAuth(adminUser, adminPass, handleDelete))
+	http.HandleFunc("/api/nodes/register", requireBasicAuth(adminUser, adminPass, handleManualRegister))
 
 	// Determine static files directory
 	staticDir := "./static"
@@ -68,7 +115,7 @@ func main() {
 
 	// Serve Static UI Console
 	fs := http.FileServer(http.Dir(staticDir))
-	http.Handle("/", fs)
+	http.Handle("/", requireBasicAuth(adminUser, adminPass, fs.ServeHTTP))
 
 	p := *port
 	if envPort := os.Getenv("PORT"); envPort != "" {
@@ -78,6 +125,16 @@ func main() {
 	log.Printf("Master Controller listening on %s", addr)
 	log.Printf("Serving console UI from: %s", staticDir)
 	log.Printf("Metadata persistence file: %s", *metaFilePath)
+	if adminPass != "" {
+		log.Printf("Admin UI security: enabled (user: admin)")
+	} else {
+		log.Printf("Admin UI security: disabled (unsecured)")
+	}
+	if clusterToken != "" {
+		log.Printf("Cluster node security: enabled")
+	} else {
+		log.Printf("Cluster node security: disabled (unsecured)")
+	}
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Master server failed: %v", err)
@@ -151,7 +208,21 @@ func startHealthChecker() {
 
 			// Active ping to measure latency and update storage details
 			start := time.Now()
-			resp, err := client.Get(fmt.Sprintf("%s/status", worker.URL))
+			req, err := http.NewRequest("GET", fmt.Sprintf("%s/status", worker.URL), nil)
+			if err != nil {
+				if worker.Status != "offline" {
+					log.Printf("Node %s (%s) unreachable: %v", id, worker.URL, err)
+				}
+				worker.Status = "offline"
+				worker.LatencyMs = -1
+				metaData.Workers[id] = worker
+				continue
+			}
+			if clusterToken != "" {
+				req.Header.Set("Authorization", "Bearer "+clusterToken)
+			}
+
+			resp, err := client.Do(req)
 			if err != nil {
 				if worker.Status != "offline" {
 					log.Printf("Node %s (%s) unreachable: %v", id, worker.URL, err)
@@ -261,6 +332,11 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Sort nodes alphabetically ascending by ID
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_space": totalPool,
@@ -283,21 +359,28 @@ func handleFilesList(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(files)
 }
 
-// selectBestWorker returns the online worker with the most free space
-func selectBestWorker() *common.WorkerStats {
+// selectBestWorkerIDs returns the online worker IDs sorted by free space descending
+func selectBestWorkerIDs(count int) []string {
 	metaLock.RLock()
 	defer metaLock.RUnlock()
 
-	var best *common.WorkerStats
-	var maxFree int64 = -1
-
+	var onlineWorkers []common.WorkerStats
 	for _, w := range metaData.Workers {
-		if w.Status == "online" && w.FreeSpace > maxFree {
-			maxFree = w.FreeSpace
-			best = &w
+		if w.Status == "online" {
+			onlineWorkers = append(onlineWorkers, w)
 		}
 	}
-	return best
+
+	// Sort by FreeSpace descending
+	sort.Slice(onlineWorkers, func(i, j int) bool {
+		return onlineWorkers[i].FreeSpace > onlineWorkers[j].FreeSpace
+	})
+
+	var ids []string
+	for i := 0; i < len(onlineWorkers) && i < count; i++ {
+		ids = append(ids, onlineWorkers[i].ID)
+	}
+	return ids
 }
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +398,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	fileName := header.Filename
+	fileName := r.FormValue("relativePath")
+	if fileName == "" {
+		fileName = header.Filename
+	}
 
 	// Check if file already exists
 	metaLock.RLock()
@@ -340,66 +426,102 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	for {
 		n, readErr := file.Read(buffer)
 		if n > 0 {
-			bestWorker := selectBestWorker()
-			if bestWorker == nil {
+			targetIDs := selectBestWorkerIDs(2) // Select up to 2 workers for RAID-1 redundancy
+			if len(targetIDs) == 0 {
 				// Clean up uploaded chunks before failing
 				for _, chk := range chunks {
-					req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", chk.WorkerURL, chk.ID), nil)
-					client.Do(req)
+					for _, rep := range chk.Replicas {
+						req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
+						if clusterToken != "" {
+							req.Header.Set("Authorization", "Bearer "+clusterToken)
+						}
+						client.Do(req)
+					}
 				}
 				http.Error(w, "No online storage workers available to store chunks", http.StatusServiceUnavailable)
 				return
 			}
 
 			chunkID := fmt.Sprintf("%s_c%d", fileID, chunkIndex)
-			chunkURL := fmt.Sprintf("%s/chunks/%s", bestWorker.URL, chunkID)
+			var replicas []common.WorkerReplica
 
-			// POST chunk to worker
-			req, err := http.NewRequest(http.MethodPost, chunkURL, bytes.NewReader(buffer[:n]))
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			req.Header.Set("Content-Type", "application/octet-stream")
+			// Write to all selected replica workers
+			for _, wID := range targetIDs {
+				metaLock.RLock()
+				bestWorker := metaData.Workers[wID]
+				metaLock.RUnlock()
 
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusCreated {
-				statusMsg := "unreachable"
-				if resp != nil {
-					statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
+				chunkURL := fmt.Sprintf("%s/chunks/%s", bestWorker.URL, chunkID)
+
+				// POST chunk to worker
+				req, err := http.NewRequest(http.MethodPost, chunkURL, bytes.NewReader(buffer[:n]))
+				if err != nil {
+					// Clean up previous chunks
+					for _, chk := range chunks {
+						for _, rep := range chk.Replicas {
+							reqDel, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
+							if clusterToken != "" {
+								reqDel.Header.Set("Authorization", "Bearer "+clusterToken)
+							}
+							client.Do(reqDel)
+						}
+					}
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
 				}
-				log.Printf("Failed to upload chunk %s to worker %s (%s)", chunkID, bestWorker.ID, statusMsg)
-				// Clean up and abort
-				for _, chk := range chunks {
-					req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", chk.WorkerURL, chk.ID), nil)
-					client.Do(req)
+				req.Header.Set("Content-Type", "application/octet-stream")
+				if clusterToken != "" {
+					req.Header.Set("Authorization", "Bearer "+clusterToken)
 				}
-				http.Error(w, "Failed to upload chunk to storage node", http.StatusInternalServerError)
-				return
+
+				resp, err := client.Do(req)
+				if err != nil || resp.StatusCode != http.StatusCreated {
+					statusMsg := "unreachable"
+					if resp != nil {
+						statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
+					}
+					log.Printf("Failed to upload chunk %s to worker %s (%s)", chunkID, bestWorker.ID, statusMsg)
+					// Clean up and abort
+					for _, chk := range chunks {
+						for _, rep := range chk.Replicas {
+							reqDel, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
+							if clusterToken != "" {
+								reqDel.Header.Set("Authorization", "Bearer "+clusterToken)
+							}
+							client.Do(reqDel)
+						}
+					}
+					http.Error(w, "Failed to upload chunk replica to storage node", http.StatusInternalServerError)
+					return
+				}
+				resp.Body.Close()
+
+				replicas = append(replicas, common.WorkerReplica{
+					WorkerID:  bestWorker.ID,
+					WorkerURL: bestWorker.URL,
+				})
+
+				// Lock and update worker free space estimate locally before actual status heartbeat syncs
+				metaLock.Lock()
+				wStats, ok := metaData.Workers[bestWorker.ID]
+				if ok {
+					wStats.UsedSpace += int64(n)
+					wStats.FreeSpace -= int64(n)
+					if wStats.FreeSpace < 0 {
+						wStats.FreeSpace = 0
+					}
+					metaData.Workers[bestWorker.ID] = wStats
+				}
+				metaLock.Unlock()
 			}
-			resp.Body.Close()
 
 			chunks = append(chunks, common.ChunkInfo{
-				ID:        chunkID,
-				Index:     chunkIndex,
-				Size:      int64(n),
-				WorkerID:  bestWorker.ID,
-				WorkerURL: bestWorker.URL,
+				ID:       chunkID,
+				Index:    chunkIndex,
+				Size:     int64(n),
+				Replicas: replicas,
 			})
 			chunkIndex++
-
-			// Lock and update worker free space estimate locally before actual status heartbeat syncs
-			metaLock.Lock()
-			wStats, ok := metaData.Workers[bestWorker.ID]
-			if ok {
-				wStats.UsedSpace += int64(n)
-				wStats.FreeSpace -= int64(n)
-				if wStats.FreeSpace < 0 {
-					wStats.FreeSpace = 0
-				}
-				metaData.Workers[bestWorker.ID] = wStats
-			}
-			metaLock.Unlock()
 		}
 
 		if readErr == io.EOF {
@@ -422,19 +544,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	metaLock.Unlock()
 
 	saveMetadata()
-	log.Printf("Successfully uploaded file: %s split into %d chunks", fileName, len(chunks))
+	log.Printf("Successfully uploaded file: %s split into %d chunks with %d-way replication", fileName, len(chunks), len(chunks[0].Replicas))
 
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte("File uploaded successfully"))
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 || parts[3] == "" {
+	fileName := strings.TrimPrefix(r.URL.Path, "/api/download/")
+	if fileName == "" {
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
-	fileName := parts[3]
 
 	metaLock.RLock()
 	fileMeta, exists := metaData.Files[fileName]
@@ -445,28 +566,60 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	// Use safe display filename for attachment header
+	safeName := fileName
+	if slashIdx := strings.LastIndex(fileName, "/"); slashIdx != -1 {
+		safeName = fileName[slashIdx+1:]
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", safeName))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileMeta.Size))
 
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	for _, chk := range fileMeta.Chunks {
-		chunkURL := fmt.Sprintf("%s/chunks/%s", chk.WorkerURL, chk.ID)
-		
-		resp, err := client.Get(chunkURL)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			statusMsg := "unreachable"
-			if resp != nil {
-				statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
+		var chunkData []byte
+		var fetchErr error
+
+		// Try downloading the chunk from any of the replicas
+		for _, rep := range chk.Replicas {
+			chunkURL := fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID)
+			req, err := http.NewRequest("GET", chunkURL, nil)
+			if err != nil {
+				fetchErr = err
+				continue
 			}
-			log.Printf("Error: Fetching chunk %s from node %s failed: %v (%s)", chk.ID, chk.WorkerID, err, statusMsg)
-			http.Error(w, fmt.Sprintf("Storage Node %s hosting file chunk is currently offline", chk.WorkerID), http.StatusServiceUnavailable)
+			if clusterToken != "" {
+				req.Header.Set("Authorization", "Bearer "+clusterToken)
+			}
+
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				chunkData, fetchErr = io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if fetchErr == nil {
+					break // Successfully read chunk data from this replica
+				}
+			} else {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				statusMsg := "unreachable"
+				if resp != nil {
+					statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
+				}
+				fetchErr = fmt.Errorf("worker %s failed: %v (%s)", rep.WorkerID, err, statusMsg)
+			}
+		}
+
+		if len(chunkData) == 0 || fetchErr != nil {
+			log.Printf("Error: All replicas for chunk %s failed: %v", chk.ID, fetchErr)
+			http.Error(w, fmt.Sprintf("All storage nodes hosting file chunk %s are offline", chk.ID), http.StatusServiceUnavailable)
 			return
 		}
 
-		_, err = io.Copy(w, resp.Body)
-		resp.Body.Close()
+		_, err := io.Copy(w, bytes.NewReader(chunkData))
 		if err != nil {
 			log.Printf("Error streaming chunk %s to client: %v", chk.ID, err)
 			return
@@ -480,12 +633,11 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 || parts[3] == "" {
+	fileName := strings.TrimPrefix(r.URL.Path, "/api/delete/")
+	if fileName == "" {
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
-	fileName := parts[3]
 
 	metaLock.Lock()
 	fileMeta, exists := metaData.Files[fileName]
@@ -501,16 +653,21 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	go func(chunks []common.ChunkInfo) {
 		client := &http.Client{Timeout: 5 * time.Second}
 		for _, chk := range chunks {
-			chunkURL := fmt.Sprintf("%s/chunks/%s", chk.WorkerURL, chk.ID)
-			req, err := http.NewRequest(http.MethodDelete, chunkURL, nil)
-			if err == nil {
-				resp, err := client.Do(req)
+			for _, rep := range chk.Replicas {
+				chunkURL := fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID)
+				req, err := http.NewRequest(http.MethodDelete, chunkURL, nil)
 				if err == nil {
-					resp.Body.Close()
+					if clusterToken != "" {
+						req.Header.Set("Authorization", "Bearer "+clusterToken)
+					}
+					resp, err := client.Do(req)
+					if err == nil {
+						resp.Body.Close()
+					}
 				}
 			}
 		}
-		log.Printf("Cleaned up chunks for deleted file: %s", fileName)
+		log.Printf("Cleaned up replica chunks for deleted file: %s", fileName)
 	}(fileMeta.Chunks)
 
 	saveMetadata()

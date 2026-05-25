@@ -13,12 +13,16 @@ type WorkerStats struct {
 	LatencyMs     int64     `json:"latency_ms"`
 }
 
-type ChunkInfo struct {
-	ID        string `json:"id"`
-	Index     int    `json:"index"`
-	Size      int64  `json:"size"`
+type WorkerReplica struct {
 	WorkerID  string `json:"worker_id"`
 	WorkerURL string `json:"worker_url"`
+}
+
+type ChunkInfo struct {
+	ID       string          `json:"id"`
+	Index    int             `json:"index"`
+	Size     int64           `json:"size"`
+	Replicas []WorkerReplica `json:"replicas"`
 }
 
 type FileMetadata struct {

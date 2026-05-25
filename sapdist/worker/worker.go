@@ -16,17 +16,52 @@ import (
 	"sapdist/common"
 )
 
+type vcapApp struct {
+	Limits struct {
+		Disk int64 `json:"disk"` // MB
+	} `json:"limits"`
+}
+
 var (
-	port       = flag.Int("port", 8081, "Port to run the worker HTTP server on")
-	storageDir = flag.String("dir", "./storage", "Directory to store chunk files")
-	quotaGB    = flag.Float64("quota", 10.0, "Total allocated storage quota in GB")
-	masterURL  = flag.String("master", "http://localhost:8080", "URL of the Master controller")
-	workerID   = flag.String("id", "", "Unique worker ID (randomly generated if empty)")
-	externalURL = flag.String("url", "", "External accessible URL of this worker (auto-derived if empty)")
+	port          = flag.Int("port", 8081, "Port to run the worker HTTP server on")
+	storageDir    = flag.String("dir", "./storage", "Directory to store chunk files")
+	quotaGB       = flag.Float64("quota", 10.0, "Total allocated storage quota in GB")
+	masterURL     = flag.String("master", "http://localhost:8080", "URL of the Master controller")
+	workerID      = flag.String("id", "", "Unique worker ID (randomly generated if empty)")
+	externalURL   = flag.String("url", "", "External accessible URL of this worker (auto-derived if empty)")
+	clusterSecret = flag.String("secret", "", "Shared secret key for cluster communication")
 )
+
+var cfQuotaBytes int64
+
+func requireToken(secret string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if secret != "" {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, "Unauthorized: Missing Authorization header", http.StatusUnauthorized)
+				return
+			}
+			parts := strings.Split(authHeader, " ")
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" || parts[1] != secret {
+				http.Error(w, "Unauthorized: Invalid secret token", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
 
 func main() {
 	flag.Parse()
+
+	// Parse VCAP_APPLICATION to dynamically detect CF disk limits
+	if vcapStr := os.Getenv("VCAP_APPLICATION"); vcapStr != "" {
+		var vcap vcapApp
+		if err := json.Unmarshal([]byte(vcapStr), &vcap); err == nil && vcap.Limits.Disk > 0 {
+			cfQuotaBytes = vcap.Limits.Disk * 1024 * 1024
+		}
+	}
 
 	// Initialize random generator seed
 	rand.Seed(time.Now().UnixNano())
@@ -38,6 +73,12 @@ func main() {
 	}
 	if id == "" {
 		id = fmt.Sprintf("worker-%d", rand.Intn(10000))
+	}
+
+	// Load shared secret key
+	secret := *clusterSecret
+	if secret == "" {
+		secret = os.Getenv("CLUSTER_SECRET")
 	}
 
 	// Create storage directory if it doesn't exist
@@ -76,15 +117,20 @@ func main() {
 	log.Printf("Quota limit: %.2f GB", *quotaGB)
 	log.Printf("Master Controller: %s", mURL)
 	log.Printf("Node Access URL: %s", urlStr)
+	if secret != "" {
+		log.Printf("Cluster security token: enabled")
+	} else {
+		log.Printf("Cluster security token: disabled (unsecured)")
+	}
 
 	// Start heartbeat loop in background if master URL is provided
 	if mURL != "" {
-		go startHeartbeatLoop(id, urlStr, mURL)
+		go startHeartbeatLoop(id, urlStr, mURL, secret)
 	}
 
 	// Define HTTP handlers
-	http.HandleFunc("/chunks/", handleChunk(id))
-	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/chunks/", requireToken(secret, handleChunk(id)))
+	http.HandleFunc("/status", requireToken(secret, handleStatus))
 
 	addr := fmt.Sprintf(":%d", p)
 	log.Printf("Worker listening on %s", addr)
@@ -95,7 +141,11 @@ func main() {
 
 // getStorageStats calculates used space by scanning the files in storage folder
 func getStorageStats() (total, free, used int64) {
-	total = int64(*quotaGB * 1024 * 1024 * 1024)
+	if cfQuotaBytes > 0 {
+		total = cfQuotaBytes
+	} else {
+		total = int64(*quotaGB * 1024 * 1024 * 1024)
+	}
 
 	err := filepath.Walk(*storageDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -163,8 +213,7 @@ func handleChunk(wID string) http.HandlerFunc {
 
 		case http.MethodPost:
 			// Write request body to chunk file
-			_, _, used := getStorageStats()
-			total := int64(*quotaGB * 1024 * 1024 * 1024)
+			total, _, used := getStorageStats()
 			
 			// Enforce quota limit (check if request content length fits)
 			if r.ContentLength > 0 && used+r.ContentLength > total {
@@ -210,9 +259,11 @@ func handleChunk(wID string) http.HandlerFunc {
 	}
 }
 
-func startHeartbeatLoop(id, urlStr, masterURL string) {
+func startHeartbeatLoop(id, urlStr, masterURL, secret string) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+
+	client := &http.Client{Timeout: 10 * time.Second}
 
 	// Define heartbeat function
 	sendHeartbeat := func() {
@@ -232,7 +283,18 @@ func startHeartbeatLoop(id, urlStr, masterURL string) {
 		}
 
 		heartbeatURL := fmt.Sprintf("%s/api/heartbeat", strings.TrimSuffix(masterURL, "/"))
-		resp, err := http.Post(heartbeatURL, "application/json", strings.NewReader(string(payload)))
+		
+		reqPost, err := http.NewRequest("POST", heartbeatURL, strings.NewReader(string(payload)))
+		if err != nil {
+			log.Printf("Error creating heartbeat request: %v", err)
+			return
+		}
+		reqPost.Header.Set("Content-Type", "application/json")
+		if secret != "" {
+			reqPost.Header.Set("Authorization", "Bearer "+secret)
+		}
+
+		resp, err := client.Do(reqPost)
 		if err != nil {
 			log.Printf("Heartbeat failed (Master offline?): %v", err)
 			return
