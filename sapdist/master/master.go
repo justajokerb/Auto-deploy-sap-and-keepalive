@@ -101,7 +101,9 @@ func main() {
 	http.HandleFunc("/api/heartbeat", requireClusterToken(clusterToken, handleHeartbeat))
 	http.HandleFunc("/api/status", requireBasicAuth(adminUser, adminPass, handleStatus))
 	http.HandleFunc("/api/files", requireBasicAuth(adminUser, adminPass, handleFilesList))
-	http.HandleFunc("/api/upload", requireBasicAuth(adminUser, adminPass, handleUpload))
+	http.HandleFunc("/api/upload/start", requireBasicAuth(adminUser, adminPass, handleUploadStart))
+	http.HandleFunc("/api/upload/chunk", requireBasicAuth(adminUser, adminPass, handleUploadChunk))
+	http.HandleFunc("/api/upload/finish", requireBasicAuth(adminUser, adminPass, handleUploadFinish))
 	http.HandleFunc("/api/download/", requireBasicAuth(adminUser, adminPass, handleDownload))
 	http.HandleFunc("/api/delete/", requireBasicAuth(adminUser, adminPass, handleDelete))
 	http.HandleFunc("/api/nodes/register", requireBasicAuth(adminUser, adminPass, handleManualRegister))
@@ -386,29 +388,45 @@ func selectBestWorkerIDs(count int) []string {
 	return ids
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
+type UploadSession struct {
+	FileID       uint64
+	FileName     string
+	Size         int64
+	TotalChunks  int
+	UploadedInfo []common.ChunkInfo // stores replica details for each chunk
+	Mu           sync.Mutex
+}
+
+var (
+	activeUploads     = make(map[string]*UploadSession)
+	activeUploadsLock sync.RWMutex
+)
+
+type StartUploadRequest struct {
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"`
+	TotalChunks int    `json:"totalChunks"`
+}
+
+type StartUploadResponse struct {
+	UploadID string `json:"uploadId"`
+}
+
+func handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Limit multipart body to 500MB
-	r.ParseMultipartForm(500 * 1024 * 1024)
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "Failed to parse file: "+err.Error(), http.StatusBadRequest)
+	var req StartUploadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Filename == "" || req.TotalChunks <= 0 {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
-	}
-	defer file.Close()
-
-	fileName := r.FormValue("relativePath")
-	if fileName == "" {
-		fileName = header.Filename
 	}
 
 	// Check if file already exists
 	metaLock.RLock()
-	_, exists := metaData.Files[fileName]
+	_, exists := metaData.Files[req.Filename]
 	metaLock.RUnlock()
 	if exists {
 		http.Error(w, "File already exists", http.StatusConflict)
@@ -416,141 +434,205 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rand.Seed(time.Now().UnixNano())
-	fileID := fmt.Sprintf("%d", rand.Int63())
+	fileID := rand.Uint64()
+	uploadID := fmt.Sprintf("%d", fileID)
 
-	buffer := make([]byte, *chunkSize)
-	var chunks []common.ChunkInfo
+	session := &UploadSession{
+		FileID:       fileID,
+		FileName:     req.Filename,
+		Size:         req.Size,
+		TotalChunks:  req.TotalChunks,
+		UploadedInfo: make([]common.ChunkInfo, req.TotalChunks),
+	}
+
+	activeUploadsLock.Lock()
+	activeUploads[uploadID] = session
+	activeUploadsLock.Unlock()
+
+	log.Printf("Starting chunked upload session %s for file %s (size: %d bytes, chunks: %d)", uploadID, req.Filename, req.Size, req.TotalChunks)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(StartUploadResponse{UploadID: uploadID})
+}
+
+func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse multipart body
+	r.ParseMultipartForm(10 * 1024 * 1024) // 10MB chunk max limit
+
+	uploadID := r.FormValue("uploadId")
+	chunkIndexStr := r.FormValue("chunkIndex")
+	
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Failed to read chunk file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
 	var chunkIndex int
+	if _, err := fmt.Sscanf(chunkIndexStr, "%d", &chunkIndex); err != nil {
+		http.Error(w, "Invalid chunkIndex", http.StatusBadRequest)
+		return
+	}
 
-	log.Printf("Starting upload of %s (size: %d bytes)", fileName, header.Size)
+	activeUploadsLock.RLock()
+	session, exists := activeUploads[uploadID]
+	activeUploadsLock.RUnlock()
+	if !exists {
+		http.Error(w, "Upload session not found or expired", http.StatusNotFound)
+		return
+	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	if chunkIndex < 0 || chunkIndex >= session.TotalChunks {
+		http.Error(w, "Chunk index out of bounds", http.StatusBadRequest)
+		return
+	}
 
-	for {
-		n, readErr := file.Read(buffer)
-		if n > 0 {
-			targetIDs := selectBestWorkerIDs(2) // Select up to 2 workers for RAID-1 redundancy
-			if len(targetIDs) == 0 {
-				// Clean up uploaded chunks before failing
-				for _, chk := range chunks {
-					for _, rep := range chk.Replicas {
-						req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
-						if clusterToken != "" {
-							req.Header.Set("Authorization", "Bearer "+clusterToken)
-						}
-						client.Do(req)
-					}
-				}
-				http.Error(w, "No online storage workers available to store chunks", http.StatusServiceUnavailable)
-				return
-			}
+	// Read entire chunk into memory (typically 2MB)
+	chunkBytes, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "Failed to read chunk data: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	chunkSizeVal := int64(len(chunkBytes))
 
-			chunkID := fmt.Sprintf("%s_c%d", fileID, chunkIndex)
-			var replicas []common.WorkerReplica
+	targetIDs := selectBestWorkerIDs(2) // Select up to 2 workers for RAID-1 redundancy
+	if len(targetIDs) == 0 {
+		http.Error(w, "No online storage workers available to store chunks", http.StatusServiceUnavailable)
+		return
+	}
 
-			// Write to all selected replica workers
-			for _, wID := range targetIDs {
-				metaLock.RLock()
-				bestWorker := metaData.Workers[wID]
-				metaLock.RUnlock()
+	chunkID := fmt.Sprintf("%d_c%d", session.FileID, chunkIndex)
+	var replicas []common.WorkerReplica
 
-				chunkURL := fmt.Sprintf("%s/chunks/%s", bestWorker.URL, chunkID)
+	client := &http.Client{Timeout: 15 * time.Second}
 
-				// POST chunk to worker
-				req, err := http.NewRequest(http.MethodPost, chunkURL, bytes.NewReader(buffer[:n]))
-				if err != nil {
-					// Clean up previous chunks
-					for _, chk := range chunks {
-						for _, rep := range chk.Replicas {
-							reqDel, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
-							if clusterToken != "" {
-								reqDel.Header.Set("Authorization", "Bearer "+clusterToken)
-							}
-							client.Do(reqDel)
-						}
-					}
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				req.Header.Set("Content-Type", "application/octet-stream")
-				if clusterToken != "" {
-					req.Header.Set("Authorization", "Bearer "+clusterToken)
-				}
+	// Upload to all target workers
+	for _, wID := range targetIDs {
+		metaLock.RLock()
+		worker, ok := metaData.Workers[wID]
+		metaLock.RUnlock()
+		if !ok || worker.Status != "online" {
+			continue
+		}
 
-				resp, err := client.Do(req)
-				if err != nil || resp.StatusCode != http.StatusCreated {
-					statusMsg := "unreachable"
-					if resp != nil {
-						statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
-					}
-					log.Printf("Failed to upload chunk %s to worker %s (%s)", chunkID, bestWorker.ID, statusMsg)
-					// Clean up and abort
-					for _, chk := range chunks {
-						for _, rep := range chk.Replicas {
-							reqDel, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/chunks/%s", rep.WorkerURL, chk.ID), nil)
-							if clusterToken != "" {
-								reqDel.Header.Set("Authorization", "Bearer "+clusterToken)
-							}
-							client.Do(reqDel)
-						}
-					}
-					http.Error(w, "Failed to upload chunk replica to storage node", http.StatusInternalServerError)
-					return
-				}
+		chunkURL := fmt.Sprintf("%s/chunks/%s", worker.URL, chunkID)
+		req, err := http.NewRequest(http.MethodPost, chunkURL, bytes.NewReader(chunkBytes))
+		if err != nil {
+			log.Printf("[%s] Failed to create request for worker %s: %v", chunkID, wID, err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		if clusterToken != "" {
+			req.Header.Set("Authorization", "Bearer "+clusterToken)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			statusMsg := "unreachable"
+			if resp != nil {
+				statusMsg = fmt.Sprintf("status=%d", resp.StatusCode)
 				resp.Body.Close()
-
-				replicas = append(replicas, common.WorkerReplica{
-					WorkerID:  bestWorker.ID,
-					WorkerURL: bestWorker.URL,
-				})
-
-				// Lock and update worker free space estimate locally before actual status heartbeat syncs
-				metaLock.Lock()
-				wStats, ok := metaData.Workers[bestWorker.ID]
-				if ok {
-					wStats.UsedSpace += int64(n)
-					wStats.FreeSpace -= int64(n)
-					if wStats.FreeSpace < 0 {
-						wStats.FreeSpace = 0
-					}
-					metaData.Workers[bestWorker.ID] = wStats
-				}
-				metaLock.Unlock()
 			}
-
-			chunks = append(chunks, common.ChunkInfo{
-				ID:       chunkID,
-				Index:    chunkIndex,
-				Size:     int64(n),
-				Replicas: replicas,
-			})
-			chunkIndex++
+			log.Printf("[%s] Failed to upload chunk to worker %s (%s)", chunkID, wID, statusMsg)
+			continue
 		}
+		resp.Body.Close()
 
-		if readErr == io.EOF {
-			break
+		replicas = append(replicas, common.WorkerReplica{
+			WorkerID:  worker.ID,
+			WorkerURL: worker.URL,
+		})
+
+		// Lock and update worker free space estimate locally before actual status heartbeat syncs
+		metaLock.Lock()
+		wStats, ok := metaData.Workers[worker.ID]
+		if ok {
+			wStats.UsedSpace += chunkSizeVal
+			wStats.FreeSpace -= chunkSizeVal
+			if wStats.FreeSpace < 0 {
+				wStats.FreeSpace = 0
+			}
+			metaData.Workers[worker.ID] = wStats
 		}
-		if readErr != nil {
-			http.Error(w, readErr.Error(), http.StatusInternalServerError)
+		metaLock.Unlock()
+	}
+
+	if len(replicas) == 0 {
+		http.Error(w, "Failed to upload chunk replica to any storage node", http.StatusInternalServerError)
+		return
+	}
+
+	session.Mu.Lock()
+	session.UploadedInfo[chunkIndex] = common.ChunkInfo{
+		ID:       chunkID,
+		Index:    chunkIndex,
+		Size:     chunkSizeVal,
+		Replicas: replicas,
+	}
+	session.Mu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+type FinishUploadRequest struct {
+	UploadID string `json:"uploadId"`
+}
+
+func handleUploadFinish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req FinishUploadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UploadID == "" {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	activeUploadsLock.Lock()
+	session, exists := activeUploads[req.UploadID]
+	if exists {
+		delete(activeUploads, req.UploadID)
+	}
+	activeUploadsLock.Unlock()
+
+	if !exists {
+		http.Error(w, "Upload session not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify all chunks are present
+	for idx, chunk := range session.UploadedInfo {
+		if len(chunk.Replicas) == 0 {
+			http.Error(w, fmt.Sprintf("Missing or failed chunk index %d", idx), http.StatusInternalServerError)
 			return
 		}
 	}
 
-	// Add file to metadata
+	// Save to metadata catalog
 	metaLock.Lock()
-	metaData.Files[fileName] = common.FileMetadata{
-		Name:       fileName,
-		Size:       header.Size,
+	metaData.Files[session.FileName] = common.FileMetadata{
+		Name:       session.FileName,
+		Size:       session.Size,
 		UploadTime: time.Now(),
-		Chunks:     chunks,
+		Chunks:     session.UploadedInfo,
 	}
 	metaLock.Unlock()
 
 	saveMetadata()
-	log.Printf("Successfully uploaded file: %s split into %d chunks with %d-way replication", fileName, len(chunks), len(chunks[0].Replicas))
+	log.Printf("Successfully completed chunked upload: %s (size: %d, chunks: %d)", session.FileName, session.Size, session.TotalChunks)
 
-	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte("File uploaded successfully"))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"success"}`))
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {

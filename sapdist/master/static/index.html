@@ -547,7 +547,7 @@
             uploadFile(task.file, task.relativePath);
         }
 
-        function uploadFile(file, relativePath) {
+        async function uploadFile(file, relativePath) {
             // Show progress bar container
             const displayPath = relativePath || file.name;
             uploadingFileName.textContent = displayPath;
@@ -555,49 +555,104 @@
             uploadProgressBar.style.width = '0%';
             progressContainer.classList.remove('hidden');
 
-            const formData = new FormData();
-            formData.append('file', file, displayPath);
-            formData.append('relativePath', displayPath);
+            const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per chunk
+            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+            let uploadId = null;
 
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/upload', true);
+            try {
+                // Step 1: Start chunked upload session
+                const startRes = await fetch('/api/upload/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filename: displayPath,
+                        size: file.size,
+                        totalChunks: totalChunks
+                    })
+                });
 
-            // Progress tracking
-            xhr.upload.onprogress = function(e) {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
+                if (!startRes.ok) {
+                    const errMsg = await startRes.text();
+                    throw new Error(errMsg || 'Failed to initialize upload session');
+                }
+
+                const startData = await startRes.json();
+                uploadId = startData.uploadId;
+
+                // Step 2: Upload chunks sequentially
+                for (let i = 0; i < totalChunks; i++) {
+                    const startByte = i * CHUNK_SIZE;
+                    const endByte = Math.min(file.size, startByte + CHUNK_SIZE);
+                    const chunkBlob = file.slice(startByte, endByte);
+
+                    const formData = new FormData();
+                    formData.append('uploadId', uploadId);
+                    formData.append('chunkIndex', i.toString());
+                    formData.append('file', chunkBlob, 'chunk');
+
+                    const uploadChunkPromise = () => new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/api/upload/chunk', true);
+
+                        xhr.onload = function() {
+                            if (xhr.status === 200) {
+                                resolve();
+                            } else {
+                                reject(new Error(xhr.responseText || `Server responded with status ${xhr.status}`));
+                            }
+                        };
+
+                        xhr.onerror = () => reject(new Error('Network error during chunk transfer'));
+                        xhr.send(formData);
+                    });
+
+                    // Upload chunk with up to 3 retries
+                    let retries = 3;
+                    while (retries > 0) {
+                        try {
+                            await uploadChunkPromise();
+                            break;
+                        } catch (err) {
+                            retries--;
+                            if (retries === 0) throw err;
+                            console.warn(`Chunk ${i} upload failed. Retrying... (${retries} left)`);
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                    }
+
+                    // Update UI progress bar
+                    const percent = Math.round(((i + 1) / totalChunks) * 100);
                     uploadingPercentage.textContent = `${percent}%`;
                     uploadProgressBar.style.width = `${percent}%`;
                 }
-            };
 
-            xhr.onload = function() {
-                if (xhr.status === 201) {
-                    showToast(`Uploaded successfully: ${displayPath}`, 'success');
-                    fetchFiles();
-                    fetchStatus();
-                } else {
-                    showToast(`Upload failed: ${displayPath} (${xhr.responseText || 'Server error'})`, 'error');
+                // Step 3: Finish chunked upload session
+                const finishRes = await fetch('/api/upload/finish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uploadId: uploadId })
+                });
+
+                if (!finishRes.ok) {
+                    const errMsg = await finishRes.text();
+                    throw new Error(errMsg || 'Failed to finalize upload');
                 }
+
+                showToast(`Uploaded successfully: ${displayPath}`, 'success');
+                fetchFiles();
+                fetchStatus();
+
+            } catch (err) {
+                console.error(err);
+                showToast(`Upload failed: ${displayPath} (${err.message})`, 'error');
+            } finally {
                 isUploading = false;
                 if (uploadQueue.length === 0) {
                     setTimeout(() => progressContainer.classList.add('hidden'), 1000);
                 } else {
                     processQueue();
                 }
-            };
-
-            xhr.onerror = function() {
-                showToast(`Upload error: ${displayPath}`, 'error');
-                isUploading = false;
-                if (uploadQueue.length === 0) {
-                    progressContainer.classList.add('hidden');
-                } else {
-                    processQueue();
-                }
-            };
-
-            xhr.send(formData);
+            }
         }
 
         function traverseFileTree(item, path) {

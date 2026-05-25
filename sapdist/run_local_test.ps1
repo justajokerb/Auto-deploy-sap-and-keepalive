@@ -73,34 +73,77 @@ try {
     Set-Content -Path $sampleFile -Value $fileContent
     $originalHash = (Get-FileHash $sampleFile).Hash
 
-    Write-Host "Uploading file..." -ForegroundColor Cyan
-    # Construct multipart form upload request
-    $boundary = [System.Guid]::NewGuid().ToString()
-    $LF = "`r`n"
-    $fileBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $sampleFile))
-    $enc = [System.Text.Encoding]::GetEncoding("iso-8859-1")
-    $fileStr = $enc.GetString($fileBytes)
-    
-    $bodyLines = (
-        "--$boundary",
-        "Content-Disposition: form-data; name=`"relativePath`"",
-        "",
-        "test_upload_folder/nested/test_upload_file.txt",
-        "--$boundary",
-        "Content-Disposition: form-data; name=`"file`"; filename=`"test_upload_file.txt`"",
-        "Content-Type: text/plain",
-        "",
-        $fileStr,
-        "--$boundary--"
-    ) -join $LF
+    Write-Host "Uploading file via chunked upload..." -ForegroundColor Cyan
 
-    $uploadHeaders = @{
-        Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("admin:$adminPass"))
-        "Content-Type" = "multipart/form-data; boundary=$boundary"
+    $filePath = Resolve-Path $sampleFile
+    $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+    $fileSize = $fileBytes.Length
+    $chunkSize = 2000 # 2KB chunks for testing
+    $totalChunks = [Math]::Max(1, [Math]::Ceiling($fileSize / $chunkSize))
+
+    $authValue = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("admin:$adminPass"))
+    $headersJson = @{
+        Authorization = $authValue
+        "Content-Type" = "application/json"
     }
 
-    $uploadResp = Invoke-WebRequest -Uri "http://localhost:8080/api/upload" -Headers $uploadHeaders -Method Post -Body $bodyLines
-    Write-Host "Upload Status: $($uploadResp.StatusCode) (Created)" -ForegroundColor Green
+    # Step 1: Start
+    $startBody = @{
+        filename = "test_upload_folder/nested/test_upload_file.txt"
+        size = $fileSize
+        totalChunks = $totalChunks
+    } | ConvertTo-Json
+
+    $startResp = Invoke-RestMethod -Uri "http://localhost:8080/api/upload/start" -Headers $headersJson -Method Post -Body $startBody
+    $uploadId = $startResp.uploadId
+    Write-Host "Upload started, Session ID: $uploadId" -ForegroundColor Gray
+
+    # Step 2: Upload Chunks
+    $enc = [System.Text.Encoding]::GetEncoding("iso-8859-1")
+    for ($i = 0; $i -lt $totalChunks; $i++) {
+        $startByte = $i * $chunkSize
+        $endByte = [Math]::Min($fileSize, $startByte + $chunkSize)
+        $len = $endByte - $startByte
+
+        $chunkBytes = New-Object byte[] $len
+        [Array]::Copy($fileBytes, $startByte, $chunkBytes, 0, $len)
+        $chunkStr = $enc.GetString($chunkBytes)
+
+        $boundary = [System.Guid]::NewGuid().ToString()
+        $LF = "`r`n"
+        $bodyLines = (
+            "--$boundary",
+            "Content-Disposition: form-data; name=`"uploadId`"",
+            "",
+            $uploadId,
+            "--$boundary",
+            "Content-Disposition: form-data; name=`"chunkIndex`"",
+            "",
+            $i.ToString(),
+            "--$boundary",
+            "Content-Disposition: form-data; name=`"file`"; filename=`"chunk`"",
+            "Content-Type: application/octet-stream",
+            "",
+            $chunkStr,
+            "--$boundary--"
+        ) -join $LF
+
+        $chunkHeaders = @{
+            Authorization = $authValue
+            "Content-Type" = "multipart/form-data; boundary=$boundary"
+        }
+
+        $chunkResp = Invoke-WebRequest -Uri "http://localhost:8080/api/upload/chunk" -Headers $chunkHeaders -Method Post -Body $bodyLines
+        Write-Host "Chunk $i uploaded, Status: $($chunkResp.StatusCode)" -ForegroundColor Gray
+    }
+
+    # Step 3: Finish
+    $finishBody = @{
+        uploadId = $uploadId
+    } | ConvertTo-Json
+
+    $finishResp = Invoke-WebRequest -Uri "http://localhost:8080/api/upload/finish" -Headers $headersJson -Method Post -Body $finishBody
+    Write-Host "Upload Finished, Status: $($finishResp.StatusCode) (Created)" -ForegroundColor Green
 
     # Wait for status sync
     Start-Sleep -Seconds 2
