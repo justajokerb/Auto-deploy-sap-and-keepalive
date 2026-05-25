@@ -1,0 +1,127 @@
+name: 一键清理sapdist分布式网盘
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: '选择需要清理的区域'
+        required: true
+        default: 'US(free)'
+        type: choice
+        options:
+          - SG(free)
+          - US(free)
+          - SAP-UAE(Dubai)
+          - SAP-AU(Sydney)
+          - SAP-US(Sterling)
+          - SAP-US-West(Colorado)
+          - SAP-JP(Tokyo)
+          - AWS-AU(Sydney)
+          - AWS-BR(São Paulo)
+          - AWS-KR(Seoul)
+          - AWS-CA(Montreal)
+          - AWS-US(VA)
+          - AWS-US(OR)
+          - AWS-EU(Frankfurt)
+          - AWS-JP(Tokyo)
+          - AWS-SG(Singapore)
+          - GCP-AU(Sydney)
+          - GCP-BR(São Paulo)
+          - GCP-US(IA)
+          - GCP-EU(Frankfurt)
+          - GCP-JP(Osaka)
+          - GCP-JP(Tokyo)
+          - GCP-IL(Tel Aviv)
+          - GCP-IN(Mumbai)
+          - GCP-KSA(Dammam)
+          - Azure-AU(Sydney)
+          - Azure-BR(São Paulo)
+          - Azure-CA(Montreal)
+          - Azure-US(VA)
+          - Azure-US(WA)
+          - Azure-EU(Netherlands)
+          - Azure-JP(Tokyo)
+          - Azure-SG(Singapore)
+      worker_prefix:
+        description: '存储节点名称前缀（以匹配删除）'
+        required: true
+        default: 'sapdist-worker'
+
+jobs:
+  cleanup-cluster:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Install CF CLI
+      run: |
+        wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
+        echo "deb https://packages.cloudfoundry.org/debian stable main" | sudo tee /etc/apt/sources.list.d/cloudfoundry-cli.list
+        sudo apt-get update
+        sudo apt-get install -y cf8-cli
+
+    - name: Determine CF API Endpoint
+      run: |
+        case "${{ github.event.inputs.region }}" in
+          "SG(free)") echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "US(free)") echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SAP-UAE(Dubai)") echo "CF_API=https://api.cf.ae01.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SAP-AU(Sydney)") echo "CF_API=https://api.cf.ap01.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SAP-US(Sterling)") echo "CF_API=https://api.cf.us01.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SAP-US-West(Colorado)") echo "CF_API=https://api.cf.us02.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SAP-JP(Tokyo)") echo "CF_API=https://api.cf.jp01.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-AU(Sydney)") echo "CF_API=https://api.cf.ap10.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-BR(São Paulo)") echo "CF_API=https://api.cf.br10.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-KR(Seoul)") echo "CF_API=https://api.cf.ap12.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-CA(Montreal)") echo "CF_API=https://api.cf.ca10.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-US(VA)") echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-US(OR)") echo "CF_API=https://api.cf.us11.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-EU(Frankfurt)") echo "CF_API=https://api.cf.eu10-005.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-JP(Tokyo)") echo "CF_API=https://api.cf.jp10.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "AWS-SG(Singapore)") echo "CF_API=https://api.cf.ap11.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-AU(Sydney)") echo "CF_API=https://api.cf.ap30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-BR(São Paulo)") echo "CF_API=https://api.cf.br30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-US(IA)") echo "CF_API=https://api.cf.us30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-EU(Frankfurt)") echo "CF_API=https://api.cf.eu30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-JP(Osaka)") echo "CF_API=https://api.cf.jp30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-JP(Tokyo)") echo "CF_API=https://api.cf.jp31.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-IL(Tel Aviv)") echo "CF_API=https://api.cf.il30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-IN(Mumbai)") echo "CF_API=https://api.cf.in30.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "GCP-KSA(Dammam)") echo "CF_API=https://api.cf.sa31.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-AU(Sydney)") echo "CF_API=https://api.cf.ap20.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-BR(São Paulo)") echo "CF_API=https://api.cf.br20.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-CA(Montreal)") echo "CF_API=https://api.cf.ca20.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-US(VA)") echo "CF_API=https://api.cf.us21.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-US(WA)") echo "CF_API=https://api.cf.us20.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-EU(Netherlands)") echo "CF_API=https://api.cf.eu20-001.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-JP(Tokyo)") echo "CF_API=https://api.cf.jp20.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "Azure-SG(Singapore)") echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV ;;
+        esac
+
+    - name: Login to Cloud Foundry
+      run: |
+        cf login -a ${{ env.CF_API }} -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}"
+        
+        ORG=$(cf orgs | sed -n '4p')
+        SPACE=$(cf spaces | sed -n '4p')
+        echo "ORG=$ORG" >> $GITHUB_ENV
+        echo "SPACE=$SPACE" >> $GITHUB_ENV
+        
+        # 切换组织空间
+        cf login -a ${{ env.CF_API }} -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}" -o "$ORG" -s "$SPACE"
+
+    - name: Clean up Master and Worker Apps
+      run: |
+        echo "Fetching app list in space ${{ env.SPACE }}..."
+        APPS=$(cf apps | awk 'NR>3 {print $1}' | grep -E "^(sapdist-master|${{ github.event.inputs.worker_prefix }})")
+        
+        if [ -z "$APPS" ]; then
+          echo "No matching applications found."
+          exit 0
+        fi
+        
+        for app in $APPS; do
+          echo "Deleting app and routing for: $app ..."
+          cf delete "$app" -f -r
+        done
+        
+        echo "Cleanup completed successfully!"
