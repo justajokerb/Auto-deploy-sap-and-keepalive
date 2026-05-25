@@ -1,21 +1,24 @@
-name: 一键清理sapdist分布式网盘
+name: 自动部署sapdist分布式网盘到SAP
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 只允许手动触发
     inputs:
       region:
-        description: '选择需要清理的区域'
+        description: '选择部署区域'
         required: true
         default: 'SG(free)'
         type: choice
         options:
-          - SG(free)
-          - US(free)
+          # 免费区域
+          - SG(free)  # azure新加坡
+          - US(free)  # aws美国
+          # SAP 区域
           - SAP-UAE(Dubai)
           - SAP-AU(Sydney)
           - SAP-US(Sterling)
           - SAP-US-West(Colorado)
           - SAP-JP(Tokyo)
+          # AWS 区域
           - AWS-AU(Sydney)
           - AWS-BR(São Paulo)
           - AWS-KR(Seoul)
@@ -25,6 +28,7 @@ on:
           - AWS-EU(Frankfurt)
           - AWS-JP(Tokyo)
           - AWS-SG(Singapore)
+          # GCP 区域
           - GCP-AU(Sydney)
           - GCP-BR(São Paulo)
           - GCP-US(IA)
@@ -34,6 +38,7 @@ on:
           - GCP-IL(Tel Aviv)
           - GCP-IN(Mumbai)
           - GCP-KSA(Dammam)
+          # Azure 区域
           - Azure-AU(Sydney)
           - Azure-BR(São Paulo)
           - Azure-CA(Montreal)
@@ -42,16 +47,60 @@ on:
           - Azure-EU(Netherlands)
           - Azure-JP(Tokyo)
           - Azure-SG(Singapore)
-      worker_prefix:
-        description: '存储节点名称前缀（以匹配删除）'
+      master_name:
+        description: '主控节点名称（留空则自动生成）'
+        required: false
+        default: ''
+      worker_count:
+        description: '存储节点 (Worker) 数量 (最大可填40)'
         required: true
+        default: '2'
+        type: string
+      worker_prefix:
+        description: '存储节点名称前缀（可选）'
+        required: false
         default: 'sapdist-worker'
 
+env:
+  MEMORY: ${{ secrets.SAPDIST_MEMORY || '128M' }}
+  DISK: ${{ secrets.SAPDIST_DISK || '10240M' }}
+
 jobs:
-  cleanup-cluster:
+  deploy-cluster:
     runs-on: ubuntu-latest
 
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Compile Linux Binaries
+      run: |
+        # 编译 Master 与 Worker 二进制程序 (Linux amd64)
+        cd sapdist
+        GOOS=linux GOARCH=amd64 go build -o master_bin master/master.go
+        GOOS=linux GOARCH=amd64 go build -o worker_bin worker/worker.go
+        
+        # 准备 Master 部署目录
+        mkdir -p ../deploy_master/static
+        cp master_bin ../deploy_master/
+        cp master/static/index.html ../deploy_master/static/
+        
+        # 准备 Worker 部署目录
+        mkdir -p ../deploy_worker
+        cp worker_bin ../deploy_worker/
+
+    - name: Generate Security Credentials
+      run: |
+        ADMIN_PASS=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16)
+        CLUSTER_SEC=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
+        echo "ADMIN_PASS=$ADMIN_PASS" >> $GITHUB_ENV
+        echo "CLUSTER_SEC=$CLUSTER_SEC" >> $GITHUB_ENV
+
     - name: Install CF CLI
       run: |
         wget -q -O - https://packages.cloudfoundry.org/debian/cli.cloudfoundry.org.key | sudo apt-key add -
@@ -61,41 +110,154 @@ jobs:
 
     - name: Determine CF API Endpoint
       run: |
+        RANDOM_STR=$(head /dev/urandom | tr -dc 'a-z' | head -c 6)
+        
         case "${{ github.event.inputs.region }}" in
-          "SG(free)") echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "US(free)") echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "SAP-UAE(Dubai)") echo "CF_API=https://api.cf.ae01.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "SAP-AU(Sydney)") echo "CF_API=https://api.cf.ap01.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "SAP-US(Sterling)") echo "CF_API=https://api.cf.us01.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "SAP-US-West(Colorado)") echo "CF_API=https://api.cf.us02.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "SAP-JP(Tokyo)") echo "CF_API=https://api.cf.jp01.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-AU(Sydney)") echo "CF_API=https://api.cf.ap10.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-BR(São Paulo)") echo "CF_API=https://api.cf.br10.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-KR(Seoul)") echo "CF_API=https://api.cf.ap12.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-CA(Montreal)") echo "CF_API=https://api.cf.ca10.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-US(VA)") echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-US(OR)") echo "CF_API=https://api.cf.us11.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-EU(Frankfurt)") echo "CF_API=https://api.cf.eu10-005.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-JP(Tokyo)") echo "CF_API=https://api.cf.jp10.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "AWS-SG(Singapore)") echo "CF_API=https://api.cf.ap11.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-AU(Sydney)") echo "CF_API=https://api.cf.ap30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-BR(São Paulo)") echo "CF_API=https://api.cf.br30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-US(IA)") echo "CF_API=https://api.cf.us30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-EU(Frankfurt)") echo "CF_API=https://api.cf.eu30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-JP(Osaka)") echo "CF_API=https://api.cf.jp30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-JP(Tokyo)") echo "CF_API=https://api.cf.jp31.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-IL(Tel Aviv)") echo "CF_API=https://api.cf.il30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-IN(Mumbai)") echo "CF_API=https://api.cf.in30.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "GCP-KSA(Dammam)") echo "CF_API=https://api.cf.sa31.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-AU(Sydney)") echo "CF_API=https://api.cf.ap20.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-BR(São Paulo)") echo "CF_API=https://api.cf.br20.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-CA(Montreal)") echo "CF_API=https://api.cf.ca20.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-US(VA)") echo "CF_API=https://api.cf.us21.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-US(WA)") echo "CF_API=https://api.cf.us20.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-EU(Netherlands)") echo "CF_API=https://api.cf.eu20-001.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-JP(Tokyo)") echo "CF_API=https://api.cf.jp20.hana.ondemand.com" >> $GITHUB_ENV ;;
-          "Azure-SG(Singapore)") echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV ;;
+          "SG(free)")
+            echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-sg$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "US(free)")
+            echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-us$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "SAP-UAE(Dubai)")
+            echo "CF_API=https://api.cf.ae01.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-ae$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "SAP-AU(Sydney)")
+            echo "CF_API=https://api.cf.ap01.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-ap$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "SAP-US(Sterling)")
+            echo "CF_API=https://api.cf.us01.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-us1$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "SAP-US-West(Colorado)")
+            echo "CF_API=https://api.cf.us02.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-us2$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "SAP-JP(Tokyo)")
+            echo "CF_API=https://api.cf.jp01.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-jp$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-AU(Sydney)")
+            echo "CF_API=https://api.cf.ap10.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsau$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-BR(São Paulo)")
+            echo "CF_API=https://api.cf.br10.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsbr$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-KR(Seoul)")
+            echo "CF_API=https://api.cf.ap12.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awskr$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-CA(Montreal)")
+            echo "CF_API=https://api.cf.ca10.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsca$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-US(VA)")
+            echo "CF_API=https://api.cf.us10-001.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsusva$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-US(OR)")
+            echo "CF_API=https://api.cf.us11.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsusor$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-EU(Frankfurt)")
+            echo "CF_API=https://api.cf.eu10-005.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awseu$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-JP(Tokyo)")
+            echo "CF_API=https://api.cf.jp10.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awsjp$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "AWS-SG(Singapore)")
+            echo "CF_API=https://api.cf.ap11.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-awssg$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-AU(Sydney)")
+            echo "CF_API=https://api.cf.ap30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpau$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-BR(São Paulo)")
+            echo "CF_API=https://api.cf.br30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpbr$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-US(IA)")
+            echo "CF_API=https://api.cf.us30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpus$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-EU(Frankfurt)")
+            echo "CF_API=https://api.cf.eu30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpeu$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-JP(Osaka)")
+            echo "CF_API=https://api.cf.jp30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpjpo$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-JP(Tokyo)")
+            echo "CF_API=https://api.cf.jp31.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpjpt$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-IL(Tel Aviv)")
+            echo "CF_API=https://api.cf.il30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpil$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-IN(Mumbai)")
+            echo "CF_API=https://api.cf.in30.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpin$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "GCP-KSA(Dammam)")
+            echo "CF_API=https://api.cf.sa31.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-gcpsa$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-AU(Sydney)")
+            echo "CF_API=https://api.cf.ap20.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azau$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-BR(São Paulo)")
+            echo "CF_API=https://api.cf.br20.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azbr$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-CA(Montreal)")
+            echo "CF_API=https://api.cf.ca20.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azca$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-US(VA)")
+            echo "CF_API=https://api.cf.us21.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azva$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-US(WA)")
+            echo "CF_API=https://api.cf.us20.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azwa$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-EU(Netherlands)")
+            echo "CF_API=https://api.cf.eu20-001.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azeu$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-JP(Tokyo)")
+            echo "CF_API=https://api.cf.jp20.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azjp$RANDOM_STR" >> $GITHUB_ENV
+            ;;
+          "Azure-SG(Singapore)")
+            echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV
+            echo "MASTER_NAME_GEN=sapdist-master-azsg$RANDOM_STR" >> $GITHUB_ENV
+            ;;
         esac
+
+    - name: Set App Names
+      run: |
+        # 设置主控节点名称
+        if [ -n "${{ github.event.inputs.master_name }}" ]; then
+          echo "MASTER_APP_NAME=${{ github.event.inputs.master_name }}" >> $GITHUB_ENV
+        else
+          echo "MASTER_APP_NAME=$MASTER_NAME_GEN" >> $GITHUB_ENV
+        fi
+        
+        # 记录心跳随机标识尾缀
+        echo "WORKER_SUFFIX=$(head /dev/urandom | tr -dc 'a-z' | head -c 4)" >> $GITHUB_ENV
 
     - name: Login to Cloud Foundry
       run: |
@@ -109,19 +271,74 @@ jobs:
         # 切换组织空间
         cf login -a ${{ env.CF_API }} -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}" -o "$ORG" -s "$SPACE"
 
-    - name: Clean up Master and Worker Apps
+    - name: Deploy Master Node
       run: |
-        echo "Fetching app list in space ${{ env.SPACE }}..."
-        APPS=$(cf apps | awk 'NR>3 {print $1}' | grep -E "^(sapdist-master|${{ github.event.inputs.worker_prefix }})")
+        cd deploy_master
+        # 部署 Master 节点并设置环境变量
+        cf push ${{ env.MASTER_APP_NAME }} -b binary_buildpack -m ${{ env.MEMORY }} -k ${{ env.DISK }} -c "./master_bin" --no-start
+        cf set-env ${{ env.MASTER_APP_NAME }} ADMIN_PASSWORD "${{ env.ADMIN_PASS }}"
+        cf set-env ${{ env.MASTER_APP_NAME }} CLUSTER_SECRET "${{ env.CLUSTER_SEC }}"
         
-        if [ -z "$APPS" ]; then
-          echo "No matching applications found."
-          exit 0
+        if cf start ${{ env.MASTER_APP_NAME }}; then
+          echo "Master deployed successfully."
+        else
+          cf delete ${{ env.MASTER_APP_NAME }} -r -f
+          echo "Master deployment failed. Cleaned resource."
+          exit 1
         fi
         
-        for app in $APPS; do
-          echo "Deleting app and routing for: $app ..."
-          cf delete "$app" -f -r
-        done
+        # 获取 Master 的 Route URL
+        MASTER_ROUTE=$(cf app ${{ env.MASTER_APP_NAME }} | grep "routes:" | awk '{print $2}')
+        if [ -z "$MASTER_ROUTE" ]; then
+          echo "Failed to get Master route"
+          exit 1
+        fi
+        echo "MASTER_URL=https://$MASTER_ROUTE" >> $GITHUB_ENV
+        echo "Master URL is: https://$MASTER_ROUTE"
+
+    - name: Deploy Worker Nodes
+      run: |
+        cd deploy_worker
+        COUNT=${{ github.event.inputs.worker_count }}
+        PREFIX=${{ github.event.inputs.worker_prefix }}
+        SUFFIX=${{ env.WORKER_SUFFIX }}
+        MASTER_URL=${{ env.MASTER_URL }}
         
-        echo "Cleanup completed successfully!"
+        for i in $(seq 1 $COUNT); do
+          WORKER_NAME="${PREFIX}-${i}-${SUFFIX}"
+          echo "Deploying Worker Node: $WORKER_NAME ..."
+          
+          # 1. 创建 Worker 应用 (不要启动，需要先绑定环境变量)
+          cf push $WORKER_NAME -b binary_buildpack -m ${{ env.MEMORY }} -k ${{ env.DISK }} -c "./worker_bin" --no-start
+          
+          # 2. 获取该 Worker 分配 of Route
+          WORKER_ROUTE=$(cf app $WORKER_NAME | grep "routes:" | awk '{print $2}')
+          WORKER_URL="https://$WORKER_ROUTE"
+          
+          # 3. 设置 Worker 所需的参数环境变量
+          cf set-env $WORKER_NAME MASTER_URL "$MASTER_URL"
+          cf set-env $WORKER_NAME WORKER_URL "$WORKER_URL"
+          cf set-env $WORKER_NAME WORKER_ID "$WORKER_NAME"
+          cf set-env $WORKER_NAME CLUSTER_SECRET "${{ env.CLUSTER_SEC }}"
+          
+          # 4. 启动 Worker 节点
+          if cf start $WORKER_NAME; then
+            echo "✅ Worker $WORKER_NAME started successfully."
+          else
+            echo "❌ Worker $WORKER_NAME failed to start."
+            cf delete $WORKER_NAME -r -f
+          fi
+        done
+
+    - name: Summary of Deployment
+      run: |
+        echo "🚀 Distributed Storage Pool deployed successfully!"
+        echo "============================================="
+        echo "Master Web Console: ${{ env.MASTER_URL }}"
+        echo "Admin Username: admin"
+        echo "Admin Password: ${{ env.ADMIN_PASS }}"
+        echo "Cluster Secret Token: ${{ env.CLUSTER_SEC }}"
+        echo "Workers deployed: ${{ github.event.inputs.worker_count }}"
+        echo "Region: ${{ github.event.inputs.region }}"
+        echo "Space: ${{ env.SPACE }}"
+        echo "============================================="
