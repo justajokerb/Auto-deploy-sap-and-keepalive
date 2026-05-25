@@ -68,7 +68,7 @@ on:
 
 env:
   MEMORY: ${{ secrets.MEMORY || '128M' }}
-  DISK: ${{ secrets.DISK || '256M' }}
+  DISK: ${{ secrets.DISK || '10G' }}
 
 jobs:
   deploy-cluster:
